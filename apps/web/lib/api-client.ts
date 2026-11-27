@@ -157,6 +157,11 @@ const endSession = () => {
   setAuthState({ status: "anonymous", user: null });
 };
 
+const ensureCurrentSession = (epoch: number, signal?: AbortSignal | null) => {
+  if (epoch !== authEpoch) throw new DOMException("登录会话已切换", "AbortError");
+  signal?.throwIfAborted();
+};
+
 const runAuthExclusive = async <T>(work: () => Promise<T>, requireWebLock = false): Promise<T> => {
   const previous = authTail;
   let release = () => {};
@@ -348,22 +353,17 @@ export const authenticatedFetch = async (input: string, init?: RequestInit): Pro
       cache: "no-store",
     });
   };
-  const ensureCurrent = () => {
-    if (epoch !== authEpoch) throw new DOMException("登录会话已切换", "AbortError");
-    init?.signal?.throwIfAborted();
-  };
-
   let response = await send(requestedToken);
-  ensureCurrent();
+  ensureCurrentSession(epoch, init?.signal);
   if (response.status === 401) {
     const code = await getErrorCode(response);
-    ensureCurrent();
+    ensureCurrentSession(epoch, init?.signal);
     if (code === ERROR_CODES.TOKEN_EXPIRED && requestedToken && !(init?.body instanceof ReadableStream)) {
       await refreshSession(requestedToken);
-      ensureCurrent();
+      ensureCurrentSession(epoch, init?.signal);
       if (accessToken) {
         response = await send(accessToken);
-        ensureCurrent();
+        ensureCurrentSession(epoch, init?.signal);
       }
     } else if (code === ERROR_CODES.TOKEN_INVALID || code === ERROR_CODES.TOKEN_MISSING) {
       endSession();
@@ -399,11 +399,14 @@ export const requestApi = async <T>(
   path: string,
   init?: RequestInit,
 ): Promise<T> => {
+  const epoch = authEpoch;
   const headers = new Headers(init?.headers);
 
   if (init?.body && !(init.body instanceof FormData) && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
 
-  return readApiData<T>(await authenticatedFetch(path, { ...init, headers }));
+  const data = await readApiData<T>(await authenticatedFetch(path, { ...init, headers }));
+  ensureCurrentSession(epoch, init?.signal);
+  return data;
 };

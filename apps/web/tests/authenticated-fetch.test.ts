@@ -67,6 +67,39 @@ it("never sends the bearer across origins and does not refresh a missing or inva
   ]);
 });
 
+it("discards a delayed business response after the login session changes", async () => {
+  vi.stubEnv("NEXT_PUBLIC_API_BASE_URL", "http://localhost:3001/api/v1");
+  let startReading = () => {};
+  let releaseBody = () => {};
+  const reading = new Promise<void>((resolve) => { startReading = resolve; });
+  const bodyReady = new Promise<void>((resolve) => { releaseBody = resolve; });
+  const oldResponse = ok({ title: "Previous session conversation" });
+  const readBody = oldResponse.json.bind(oldResponse);
+  vi.spyOn(oldResponse, "json").mockImplementation(async () => {
+    startReading();
+    await bodyReady;
+    return readBody();
+  });
+
+  vi.stubGlobal("fetch", vi.fn(async (input: string) => {
+    if (input.endsWith("/login")) return ok({ ...token("access"), user: USER });
+    if (input.endsWith("/logout")) return new Response(null, { status: 204 });
+    return oldResponse;
+  }));
+
+  const client = await import("../lib/api-client");
+  const credentials = { email: USER.email, password: "test-password" };
+  await client.signIn(credentials);
+  const pending = client.requestApi(client.apiPath(`/conversations/${USER.id}`));
+  await reading;
+  await client.signOut();
+  await client.signIn(credentials);
+  releaseBody();
+
+  await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+  expect(client.getAuthState()).toEqual({ status: "authenticated", user: USER });
+});
+
 it("lets the browser encode authenticated FormData with a multipart boundary", async () => {
   const fetcher = vi.fn(async (input: string, init?: RequestInit) => {
     if (input.endsWith("/login")) return ok({ ...token("access"), user: USER });
