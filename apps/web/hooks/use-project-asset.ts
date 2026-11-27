@@ -52,6 +52,7 @@ export const useSaveProjectAsset = () => {
   const queryClient = useQueryClient();
 
   return useMutation({
+    networkMode: "always",
     mutationFn: async ({
       ownerId,
       projectId,

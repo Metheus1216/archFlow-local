@@ -1,4 +1,4 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { onlineManager, QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { AssetInput, Conversation } from "@arch-flow/shared";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -104,6 +104,46 @@ it("uses formal authorized routes to restore, save and reopen an asset, and fork
       [`${BASE_URL}/conversations/${CONVERSATION_ID}/fork`, "POST", "Bearer access", REQUEST_KEY, { sourceMessageId: MESSAGE_ID }],
     ]);
   } finally {
+    client.clear();
+  }
+});
+
+it("returns an offline asset save failure and can retry the same submission", async () => {
+  vi.stubEnv("NEXT_PUBLIC_API_BASE_URL", BASE_URL);
+  vi.stubGlobal("location", new URL("https://app.example.test"));
+  const networkFailure = new TypeError("Failed to fetch");
+  const sendAsset = vi.fn<(init?: RequestInit) => Promise<Response>>(async () => {
+    if (!onlineManager.isOnline()) throw networkFailure;
+    return ok(ASSET);
+  });
+  vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
+    if (url === `${BASE_URL}/auth/login`)
+      return ok({ accessToken: "access", tokenType: "Bearer", expiresIn: 900, user: USER });
+    if (url === `${BASE_URL}/projects/${PROJECT_ID}/assets`) return sendAsset(init);
+    throw new Error(`Unexpected request ${url}`);
+  });
+
+  const { signIn } = await import("../lib/api-client");
+  const { useSaveProjectAsset } = await import("../hooks/use-project-asset");
+  await signIn({ email: USER.email, password: "test-password" });
+
+  const client = new QueryClient();
+  const saveAsset = readHook(client, useSaveProjectAsset);
+  const submission = { ownerId: USER.id, projectId: PROJECT_ID, input: SAVED_CANVAS, idempotencyKey: REQUEST_KEY };
+  const wasOnline = onlineManager.isOnline();
+
+  try {
+    onlineManager.setOnline(false);
+    const failed = saveAsset.mutateAsync(submission).catch((error: unknown) => error);
+    expect(client.getMutationCache().getAll()[0]?.state.isPaused).toBe(false);
+    await expect(failed).resolves.toBe(networkFailure);
+
+    onlineManager.setOnline(true);
+    await expect(saveAsset.mutateAsync(submission)).resolves.toEqual(ASSET);
+    expect(sendAsset.mock.calls.map(([init]) => new Headers(init?.headers).get("Idempotency-Key"))).toEqual([REQUEST_KEY, REQUEST_KEY]);
+  } finally {
+    onlineManager.setOnline(wasOnline);
+    await client.resumePausedMutations();
     client.clear();
   }
 });
