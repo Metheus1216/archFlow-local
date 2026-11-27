@@ -13,7 +13,7 @@ type Journal = {
   sequence: number;
   events: Event[];
   listeners: Set<Listener>;
-  settled?: RunStatus;
+  settled?: { status: RunStatus; frames: Frame[] };
   touched: number;
 };
 
@@ -53,6 +53,7 @@ const resultFrames = ({ run, message, interrupt }: RunSnapshot): Frame[] => {
 };
 
 const isActive = (status: RunStatus) => status === "queued" || status === "running";
+const isTerminal = (status: RunStatus) => !isActive(status) && status !== "waiting_input";
 
 export class RunEvents {
   private readonly journals = new Map<string, Journal>();
@@ -80,15 +81,7 @@ export class RunEvents {
 
   settle = (snapshot: RunSnapshot, traceId: string) => {
     if (isActive(snapshot.run.status)) return;
-    const journal = this.get(snapshot.run.id);
-    if (journal.settled === snapshot.run.status) return;
-    if (!journal.events.length || journal.settled !== undefined) {
-      journal.events = [];
-      journal.sequence = Math.max(journal.sequence, snapshot.streamSequence);
-      this.append(journal, runStart(snapshot, traceId));
-    }
-    journal.settled = snapshot.run.status;
-    for (const frame of resultFrames(snapshot)) this.append(journal, frame);
+    this.settleJournal(this.get(snapshot.run.id), snapshot, traceId);
   };
 
   subscribe = (snapshot: RunSnapshot, traceId: string, cursor: number | undefined, listener: Listener) => {
@@ -99,20 +92,22 @@ export class RunEvents {
       throw runException(409, ERROR_CODES.RUN_NOT_RESUMABLE, "续接位置无效，请刷新会话");
 
     const journal = cached ?? this.get(runId, Math.max(cursor ?? 0, snapshot.streamSequence));
-    const staleCycle = journal.settled === "waiting_input" &&
-      (snapshot.run.status === "queued" || snapshot.run.status === "canceled" || snapshot.run.status === "failed");
+    if (cached && isTerminal(snapshot.run.status)) this.settleJournal(journal, snapshot, traceId);
+    const settled = journal.settled;
+    const staleCycle = settled?.status === "waiting_input" && snapshot.run.status === "queued";
     const first = journal.events[0];
     const lostPrefix = first && (first.frame === SSE_DONE || first.frame.type !== "run-start");
     const needsSnapshot = !first || staleCycle || (lostPrefix && (cursor ?? 0) < first.id - 1) ||
-      (journal.settled !== undefined && cursor !== undefined && cursor >= (journal.events.at(-1)?.id ?? 0));
+      (settled !== undefined && cursor !== undefined && cursor >= (journal.events.at(-1)?.id ?? 0));
 
     let backlog: Event[];
     if (needsSnapshot) {
-      const frames = [runStart(snapshot, traceId), ...resultFrames(snapshot)];
+      const result = settled && isTerminal(settled.status) ? settled.frames : resultFrames(snapshot);
+      const frames = [runStart(snapshot, traceId), ...result];
       backlog = frames.map((frame) => ({ id: ++journal.sequence, frame }));
       if (!first || staleCycle) {
         journal.events = backlog;
-        journal.settled = isActive(snapshot.run.status) ? undefined : snapshot.run.status;
+        journal.settled = isActive(snapshot.run.status) ? undefined : { status: snapshot.run.status, frames: result };
       }
     } else {
       backlog = journal.events.filter(({ id }) => cursor === undefined || id > cursor);
@@ -120,6 +115,20 @@ export class RunEvents {
     journal.touched = Date.now();
     journal.listeners.add(listener);
     return { backlog, unsubscribe: () => journal.listeners.delete(listener) };
+  };
+
+  private settleJournal = (journal: Journal, snapshot: RunSnapshot, traceId: string) => {
+    const settled = journal.settled;
+    const { status } = snapshot.run;
+    if (settled && (settled.status === status || isTerminal(settled.status))) return;
+    if (!journal.events.length || settled) {
+      journal.events = [];
+      journal.sequence = Math.max(journal.sequence, snapshot.streamSequence);
+      this.append(journal, runStart(snapshot, traceId));
+    }
+    const frames = resultFrames(snapshot);
+    journal.settled = { status, frames };
+    for (const frame of frames) this.append(journal, frame);
   };
 
   private get = (runId: string, floor = 0): Journal => {
